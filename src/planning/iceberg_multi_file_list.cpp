@@ -13,6 +13,7 @@
 #include "duckdb/execution/executor.hpp"
 
 #include "planning/iceberg_multi_file_reader.hpp"
+#include "planning/iceberg_manifest_partition_row_group.hpp"
 #include "function/iceberg_functions.hpp"
 #include "planning/metadata_io/deletes/iceberg_deletes_file_reader.hpp"
 #include "common/iceberg_utils.hpp"
@@ -397,22 +398,33 @@ void IcebergMultiFileList::GetStatistics(vector<PartitionStatistics> &result) co
 		return;
 	}
 
+	//! Make sure all manifests are read and all live data files are enumerated into 'data_manifest_entries'.
+	//! This also populates 'delete_manifests'. NOTE: GetTotalFileCount takes the lock internally, so it must be
+	//! called *before* we acquire the lock below.
+	(void)GetTotalFileCount();
+
+	lock_guard<mutex> guard(lock);
+
 	if (!delete_manifests.empty()) {
-		//! if exist delete_manifests, return;
+		//! Manifest bounds are not adjusted for positional/equality deletes, so MIN/MAX derived from them could be
+		//! wrong after deletes. Emit no statistics to force a full scan, which is required for correctness.
 		return;
 	}
 
-	idx_t count = 0;
-	for (idx_t i = 0; i < data_manifests.size(); i++) {
-		auto &manifest = data_manifests[i].entry.file;
-		count += manifest.existing_rows_count;
-		count += manifest.added_rows_count;
-	}
+	auto &metadata = GetMetadata();
+	auto &columns = GetSchema().columns;
+	//! Emit one partition per live data file. 'data_manifest_entries' already excludes DELETED entries, puffin files,
+	//! and files pruned by pushed-down filters (see GetDataFile).
+	for (auto &bound_entry : data_manifest_entries) {
+		auto &data_file = bound_entry.entry.data_file;
 
-	PartitionStatistics partition_stats;
-	partition_stats.count = count;
-	partition_stats.count_type = CountType::COUNT_EXACT;
-	result.push_back(partition_stats);
+		PartitionStatistics partition_stats;
+		partition_stats.count = NumericCast<idx_t>(data_file.record_count);
+		partition_stats.count_type = CountType::COUNT_EXACT;
+		partition_stats.partition_row_group =
+		    IcebergManifestPartitionRowGroup::Create(columns, metadata, data_file, table);
+		result.push_back(std::move(partition_stats));
+	}
 }
 
 void IcebergPredicateStats::SetLowerBound(const Value &new_lower_bound) {
