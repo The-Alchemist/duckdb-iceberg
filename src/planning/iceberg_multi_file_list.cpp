@@ -13,6 +13,7 @@
 #include "duckdb/execution/executor.hpp"
 
 #include "planning/iceberg_multi_file_reader.hpp"
+#include "planning/iceberg_parquet_partition_row_group.hpp"
 #include "function/iceberg_functions.hpp"
 #include "planning/metadata_io/deletes/iceberg_deletes_file_reader.hpp"
 #include "common/iceberg_utils.hpp"
@@ -397,22 +398,32 @@ void IcebergMultiFileList::GetStatistics(vector<PartitionStatistics> &result) co
 		return;
 	}
 
+	//! Make sure all manifests are read and all live data files are enumerated into 'data_manifest_entries'.
+	//! NOTE: GetTotalFileCount takes the lock internally, so it must be called *before* we acquire the lock below.
+	(void)GetTotalFileCount();
+
+	lock_guard<mutex> guard(lock);
+
 	if (!delete_manifests.empty()) {
-		//! if exist delete_manifests, return;
+		//! Parquet footer min/max are not adjusted for positional/equality deletes, so MIN/MAX derived from them could
+		//! be wrong after deletes. Emit no statistics to force a full scan, which is required for correctness.
 		return;
 	}
 
-	idx_t count = 0;
-	for (idx_t i = 0; i < data_manifests.size(); i++) {
-		auto &manifest = data_manifests[i].entry.file;
-		count += manifest.existing_rows_count;
-		count += manifest.added_rows_count;
+	auto &columns = GetSchema().columns;
+	//! Emit one partition per live data file. We read the Parquet footer of each file and expose its column min/max -
+	//! gated on the Parquet 'is_*_value_exact' flags - so DuckDB can fold bare MIN/MAX/COUNT(*) without reading any
+	//! Parquet column data. 'data_manifest_entries' already excludes DELETED entries, puffin files, and files pruned
+	//! by pushed-down filters (see GetDataFile).
+	for (idx_t i = 0; i < data_manifest_entries.size(); i++) {
+		auto file = GetFileInternal(i, guard);
+		if (file.path.empty()) {
+			continue;
+		}
+		auto &data_file = data_manifest_entries[i].entry.data_file;
+		auto record_count = NumericCast<idx_t>(data_file.record_count);
+		IcebergParquetPartitionRowGroup::AddFileStatistics(context, file, record_count, columns, table, result);
 	}
-
-	PartitionStatistics partition_stats;
-	partition_stats.count = count;
-	partition_stats.count_type = CountType::COUNT_EXACT;
-	result.push_back(partition_stats);
 }
 
 void IcebergPredicateStats::SetLowerBound(const Value &new_lower_bound) {
