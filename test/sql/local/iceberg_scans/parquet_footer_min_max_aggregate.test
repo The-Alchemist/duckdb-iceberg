@@ -1,0 +1,42 @@
+# name: test/sql/local/iceberg_scans/parquet_footer_min_max_aggregate.test
+# group: [iceberg_scans]
+
+require avro
+
+require parquet
+
+require iceberg
+
+# This persistent table is written by an external writer (pyiceberg/Spark) whose Parquet footers do NOT carry the
+# 'is_min_value_exact' / 'is_max_value_exact' flags. The eager MIN/MAX rewrite therefore must NOT fold (it has no
+# proof the bounds are exact) and must fall back to a normal scan - but the results must still be correct.
+#
+# Tables written by DuckDB DO carry the exact flags, in which case MIN/MAX/COUNT(*) fold to constants straight from
+# the Parquet footer (no Parquet column data read). That path requires a catalog-backed INSERT and is exercised by
+# the catalog-gated insert tests.
+
+statement ok
+CREATE VIEW expr_filter AS SELECT * FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persistent/expression_filter');
+
+query III
+SELECT min(id), max(id), count(*) FROM expr_filter;
+----
+1	3	3
+
+# VARCHAR MIN/MAX must also be correct via the fallback
+query II
+SELECT min(value), max(value) FROM expr_filter;
+----
+bar	foo
+
+# The folded result (optimizer on) must equal the result computed by a real scan (statistics propagation disabled)
+statement ok
+SET disabled_optimizers='statistics_propagation';
+
+query III
+SELECT min(id), max(id), count(*) FROM expr_filter;
+----
+1	3	3
+
+statement ok
+SET disabled_optimizers='';
