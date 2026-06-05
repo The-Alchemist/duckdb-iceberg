@@ -1,0 +1,65 @@
+# name: test/sql/local/iceberg_scans/manifest_min_max_aggregate.test
+# group: [iceberg_scans]
+
+require-env DUCKDB_ICEBERG_HAVE_GENERATED_DATA
+
+require avro
+
+require parquet
+
+require iceberg
+
+statement ok
+attach ':memory:' as my_datalake;
+
+statement ok
+create schema my_datalake.default;
+
+statement ok
+create view my_datalake.default.filtering_on_bounds as select * from ICEBERG_SCAN('__WORKING_DIRECTORY__/data/generated/iceberg/spark-local/default/filtering_on_bounds');
+
+# 5 snapshots that each add 1000 rows (incremental), col1 ranges over 0..4999
+query I
+select count(*) from my_datalake.default.filtering_on_bounds;
+----
+5000
+
+# MAX / MIN should fold to constants using the manifest lower/upper bounds (no Parquet column read)
+query I
+select max(col1) from my_datalake.default.filtering_on_bounds;
+----
+4999
+
+query I
+select min(col1) from my_datalake.default.filtering_on_bounds;
+----
+0
+
+# Both at once, plus COUNT(*) which is also answered from manifest record counts
+query III
+select min(col1), max(col1), count(*) from my_datalake.default.filtering_on_bounds;
+----
+0	4999	5000
+
+# Cross-check the manifest ground-truth: the maximum upper_bound across data files equals MAX(col1)
+query I
+SELECT MAX(CAST(upper_bound AS INTEGER))
+FROM ICEBERG_COLUMN_STATS('__WORKING_DIRECTORY__/data/generated/iceberg/spark-local/default/filtering_on_bounds')
+WHERE column_name = 'col1';
+----
+4999
+
+# Cross-check the minimum lower_bound across data files equals MIN(col1)
+query I
+SELECT MIN(CAST(lower_bound AS INTEGER))
+FROM ICEBERG_COLUMN_STATS('__WORKING_DIRECTORY__/data/generated/iceberg/spark-local/default/filtering_on_bounds')
+WHERE column_name = 'col1';
+----
+0
+
+# MAX over the manifest-folded path must agree with a forced full scan of the data
+query I
+select max(col1) = (select max(col1) from my_datalake.default.filtering_on_bounds where col1 >= 0)
+from my_datalake.default.filtering_on_bounds;
+----
+true
