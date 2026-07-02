@@ -20,6 +20,19 @@ if(ICEBERG_ENABLE_EQUALITY_DELETE_WRITES)
 	add_definitions(-DICEBERG_ENABLE_EQUALITY_DELETE_WRITES)
 endif()
 
+# The Iceberg scan reads exact MIN/MAX from Parquet footers; we therefore need the Parquet extension headers
+# (ParquetReader / ParquetColumnSchema) and the thrift-generated Parquet metadata types. The Parquet extension is
+# built within the DuckDB tree (it is a required dependency of this extension at runtime anyway), and its symbols
+# are exported from libduckdb.
+include_directories(
+	${CMAKE_SOURCE_DIR}/extension/parquet/include
+	${CMAKE_SOURCE_DIR}/third_party/parquet
+	${CMAKE_SOURCE_DIR}/third_party/thrift
+	${CMAKE_SOURCE_DIR}/third_party/snappy
+	${CMAKE_SOURCE_DIR}/third_party/fastpforlib
+	${CMAKE_SOURCE_DIR}/third_party/lz4
+	${CMAKE_SOURCE_DIR}/third_party/brotli/include)
+
 
 set(EXTENSION_SOURCES
 	src/catalog/rest/api/api_utils.cpp
@@ -99,6 +112,7 @@ set(EXTENSION_SOURCES
 	src/planning/iceberg_multi_file_list.cpp
 	src/planning/iceberg_multi_file_reader.cpp
 	src/planning/iceberg_optimizer.cpp
+	src/planning/iceberg_parquet_partition_row_group.cpp
 	src/planning/metadata_io/avro/avro_scan.cpp
 	src/planning/metadata_io/avro/iceberg_avro_multi_file_list.cpp
 	src/planning/metadata_io/avro/iceberg_avro_multi_file_reader.cpp
