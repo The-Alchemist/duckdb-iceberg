@@ -14,6 +14,22 @@
 
 namespace duckdb {
 
+idx_t IcebergUtils::ParseByteSizeOptionallyFormatted(const string &input) {
+	idx_t result;
+	auto error = StringUtil::TryParseFormattedBytes(input, result);
+	if (error.empty()) {
+		return result;
+	}
+
+	try {
+		auto parsed = std::stoll(input);
+		return parsed;
+	} catch (...) {
+		throw InvalidConfigurationException("Invalid format for 'write.target-file-size-bytes' (%s), error: %s", input,
+		                                    error);
+	}
+}
+
 CopyFunctionCatalogEntry &IcebergUtils::GetCopyFunction(ClientContext &context, const string &name) {
 	// Logic is partially duplicated from Catalog::AutoLoadExtensionByCatalogEntry(db, CatalogType::COPY_FUNCTION_ENTRY,
 	// name), but that do not offer enough control
@@ -197,9 +213,14 @@ string IcebergUtils::GetFullPath(const string &iceberg_path, const string &relat
 		return fs.JoinPath(iceberg_path, relative_file_path.substr(found + 1));
 	}
 
-	found = lpath.rfind("/data/");
+	if (StringUtil::StartsWith(lpath, "data")) {
+		found = 0;
+	} else {
+		found = lpath.rfind("/data/") + 1;
+	}
+
 	if (found != string::npos) {
-		return fs.JoinPath(iceberg_path, relative_file_path.substr(found + 1));
+		return fs.JoinPath(iceberg_path, relative_file_path.substr(found));
 	}
 
 	throw InvalidConfigurationException("Could not create full path from Iceberg Path (%s) and the relative path (%s)",
