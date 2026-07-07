@@ -158,6 +158,7 @@ public:
 	void SetTable(IcebergTableEntry *table);
 	void SetOptions(const IcebergOptions &options);
 	void SetScanOrder(unique_ptr<RowGroupOrderOptions> options);
+	void SetPartitionsToScan(vector<idx_t> partition_indices);
 
 	void Bind(vector<LogicalType> &return_types, vector<Identifier> &names);
 	unique_ptr<IcebergMultiFileList> PushdownInternal(ClientContext &context, TableFilterSet &new_filters,
@@ -254,6 +255,9 @@ private:
 	//! Set by the table function's set_scan_order callback when an ORDER BY ... LIMIT can drive scan order.
 	mutable unique_ptr<RowGroupOrderOptions> scan_order_options;
 	mutable bool scan_order_applied = false;
+
+	//! When set, only these partition indices (into data_manifest_entries) are scanned.
+	mutable vector<idx_t> partitions_to_scan;
 
 	//! References to items inside the 'manifest_entries' of the list entries in the 'data_manifests'
 	mutable vector<BoundIcebergManifestEntry> data_manifest_entries;

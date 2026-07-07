@@ -1,0 +1,88 @@
+# name: test/sql/local/iceberg_scans/manifest_min_max_aggregate_partial.test
+# description: Partial MIN/MAX precompute when only some files have manifest bounds (schema-evolved column)
+# group: [iceberg_scans]
+
+require avro
+
+require parquet
+
+require iceberg
+
+require icu
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+SET TimeZone='Europe/Amsterdam';
+
+# add_columns_with_defaults: col1 file predates added columns; col_timestamp bounds exist only on the newer file.
+statement ok
+CREATE VIEW schema_evolved AS SELECT * FROM iceberg_scan('{WORKING_DIRECTORY}/data/persistent/add_columns_with_defaults/default.db/add_columns_with_defaults/metadata/00003-3f1801a5-7dfb-4072-b14a-39cd12f9279b.metadata.json');
+
+query I
+SELECT count(DISTINCT file_path) FROM iceberg_metadata('{WORKING_DIRECTORY}/data/persistent/add_columns_with_defaults/default.db/add_columns_with_defaults/metadata/00003-3f1801a5-7dfb-4072-b14a-39cd12f9279b.metadata.json') WHERE manifest_content='DATA';
+----
+2
+
+query I
+SELECT count(DISTINCT file_path) FROM iceberg_column_stats('{WORKING_DIRECTORY}/data/persistent/add_columns_with_defaults/default.db/add_columns_with_defaults/metadata/00003-3f1801a5-7dfb-4072-b14a-39cd12f9279b.metadata.json') WHERE column_name='col_timestamp' AND lower_bound != 'NULL';
+----
+1
+
+query I
+SELECT max(col_timestamp) FROM schema_evolved;
+----
+1970-01-01 00:00:00.012345
+
+# Partial path: merge precomputed manifest max with a scan of files missing bounds.
+query II
+EXPLAIN SELECT max(col_timestamp) FROM schema_evolved;
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+query II
+EXPLAIN SELECT max(col_timestamp) FROM schema_evolved;
+----
+physical_plan	<REGEX>:.*ICEBERG_SCAN.*
+
+query II
+EXPLAIN SELECT max(col_timestamp) FROM schema_evolved;
+----
+physical_plan	<!REGEX>:.*COLUMN_DATA_SCAN.*
+
+statement ok
+SET disabled_optimizers='statistics_propagation';
+
+query I
+SELECT max(col_timestamp) FROM schema_evolved;
+----
+1970-01-01 00:00:00.012345
+
+statement ok
+RESET disabled_optimizers;
+
+# Full fold on TIMESTAMPTZ (multi-file runtime table; icu required for timestamptz arithmetic).
+statement ok
+SET TimeZone='UTC';
+
+statement ok
+COPY (SELECT (range)::BIGINT AS id, ('2024-01-01'::TIMESTAMPTZ + (range::BIGINT * interval '1 second')) AS ts FROM range(3000000)) TO '{TEST_DIR}/manifest_tstz_fold' (FORMAT ICEBERG);
+
+statement ok
+CREATE VIEW tstz_fold AS SELECT ts FROM iceberg_scan('{TEST_DIR}/manifest_tstz_fold');
+
+query I
+SELECT max(ts) FROM tstz_fold;
+----
+2024-02-04 17:19:59+00
+
+query II
+EXPLAIN SELECT max(ts) FROM tstz_fold;
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+query II
+EXPLAIN SELECT max(ts) FROM tstz_fold;
+----
+physical_plan	<!REGEX>:.*ICEBERG_SCAN.*

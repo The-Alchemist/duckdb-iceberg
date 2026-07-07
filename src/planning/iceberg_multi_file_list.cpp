@@ -306,6 +306,12 @@ void IcebergMultiFileList::SetScanOrder(unique_ptr<RowGroupOrderOptions> options
 	scan_order_applied = false;
 }
 
+void IcebergMultiFileList::SetPartitionsToScan(vector<idx_t> partition_indices) {
+	//! Whitelist of data-file indices for partial aggregate precompute (see GetFileInternal remapping).
+	partitions_to_scan = std::move(partition_indices);
+	std::sort(partitions_to_scan.begin(), partitions_to_scan.end());
+}
+
 unique_ptr<ExpressionFilter> IcebergMultiFileList::GetFilterForColumnIndex(const IcebergTableFilters &filter_set,
                                                                            const ColumnIndex &column_index) const {
 	auto primary_index = column_index.GetPrimaryIndex();
@@ -406,6 +412,8 @@ unique_ptr<IcebergMultiFileList> IcebergMultiFileList::PushdownInternal(ClientCo
 	if (scan_order_options) {
 		filtered_list->scan_order_options = make_uniq<RowGroupOrderOptions>(*scan_order_options);
 	}
+	//! Preserve partial-scan whitelist across filter pushdown copies.
+	filtered_list->partitions_to_scan = partitions_to_scan;
 	return filtered_list;
 }
 
@@ -461,10 +469,13 @@ unique_ptr<MultiFileList> IcebergMultiFileList::ComplexFilterPushdown(ClientCont
 
 vector<OpenFileInfo> IcebergMultiFileList::GetAllFiles() const {
 	vector<OpenFileInfo> file_list;
-	//! Lock is required because it reads the 'manifest_entries' vector
 	lock_guard<mutex> guard(shared_state->lock);
-	for (idx_t i = 0; i < data_manifest_entries.size(); i++) {
-		file_list.push_back(GetFileInternal(i, guard));
+	for (idx_t i = 0;; i++) {
+		auto file = GetFileInternal(i, guard);
+		if (file.path.empty()) {
+			break;
+		}
+		file_list.push_back(std::move(file));
 	}
 	return file_list;
 }
@@ -483,6 +494,10 @@ idx_t IcebergMultiFileList::GetTotalFileCount() const {
 	// FIXME: the 'added_files_count' + the 'existing_files_count'
 	// in the Manifest List should give us this information without scanning the manifest file(s)
 	lock_guard<mutex> guard(shared_state->lock);
+
+	if (!partitions_to_scan.empty()) {
+		return partitions_to_scan.size();
+	}
 
 	idx_t i = data_manifest_entries.size();
 	while (!GetFileInternal(i, guard).path.empty()) {
@@ -1114,7 +1129,17 @@ OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mut
 	}
 	EnsureScanOrderApplied(guard);
 
-	auto found_manifest_entry = GetDataFile(file_id, guard);
+	// When partial aggregate precompute is active, scan indices 0..N-1 map to manifest entry indices
+	// in partitions_to_scan rather than the full data_manifest_entries list.
+	idx_t manifest_entry_idx = file_id;
+	if (!partitions_to_scan.empty()) {
+		if (file_id >= partitions_to_scan.size()) {
+			return OpenFileInfo();
+		}
+		manifest_entry_idx = partitions_to_scan[file_id];
+	}
+
+	auto found_manifest_entry = GetDataFile(manifest_entry_idx, guard);
 	if (!found_manifest_entry) {
 		return OpenFileInfo();
 	}

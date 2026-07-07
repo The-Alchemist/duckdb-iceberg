@@ -78,6 +78,12 @@ static void IcebergSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, 
 	file_list.SetScanOrder(std::move(order_options));
 }
 
+static void IcebergSetPartitionsToScan(vector<idx_t> partition_indices, optional_ptr<FunctionData> bind_data) {
+	auto &multi_file_data = bind_data->Cast<MultiFileBindData>();
+	auto &file_list = multi_file_data.file_list->Cast<IcebergMultiFileList>();
+	file_list.SetPartitionsToScan(std::move(partition_indices));
+}
+
 //! FIXME: needs v1.5.1, causes a crash on v1.5.0
 // static bool IcebergScanSupportsPushdownType(const FunctionData &bind_data_p, idx_t column_id) {
 //	// Don't push down filters on the _row_id virtual column
@@ -112,6 +118,8 @@ TableFunctionSet IcebergFunctions::GetIcebergScanFunction(ExtensionLoader &loade
 		function.get_virtual_columns = IcebergVirtualColumns;
 		function.get_partition_stats = IcebergMultiFileReader::IcebergGetPartitionStats;
 		function.set_scan_order = IcebergSetScanOrder;
+		// Partial MIN/MAX precompute: restrict the scan to files without usable manifest bounds.
+		function.set_partitions_to_scan = IcebergSetPartitionsToScan;
 		// function.supports_pushdown_type = IcebergScanSupportsPushdownType;
 
 		// Schema param is just confusing here
