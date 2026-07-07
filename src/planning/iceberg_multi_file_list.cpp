@@ -22,6 +22,7 @@
 #include "duckdb/storage/table/row_group_reorderer.hpp"
 
 #include "planning/iceberg_multi_file_reader.hpp"
+#include "planning/iceberg_manifest_partition_row_group.hpp"
 #include "function/iceberg_functions.hpp"
 #include "planning/metadata_io/deletes/iceberg_deletes_file_reader.hpp"
 #include "common/iceberg_utils.hpp"
@@ -548,27 +549,24 @@ void IcebergMultiFileList::GetStatistics(vector<PartitionStatistics> &result) co
 		return;
 	}
 
+	(void)GetTotalFileCount();
+
+	lock_guard<mutex> guard(shared_state->lock);
+
 	for (idx_t i = 0; i < delete_manifests.size(); i++) {
 		if (delete_manifest_matches[i]) {
-			//! if a matching delete manifest exists, return;
+			//! Manifest min/max are not adjusted for deletes; disable folding for correctness.
 			return;
 		}
 	}
 
-	idx_t count = 0;
-	for (idx_t i = 0; i < data_manifests.size(); i++) {
-		auto &manifest = data_manifests[i].entry.file;
-		if (!data_manifest_matches[i]) {
-			continue;
-		}
-		count += manifest.existing_rows_count;
-		count += manifest.added_rows_count;
+	auto &columns = GetSchema().columns;
+	auto &metadata = GetMetadata();
+	auto table = GetTable();
+	for (idx_t i = 0; i < data_manifest_entries.size(); i++) {
+		auto &data_file = data_manifest_entries[i].entry.data_file;
+		IcebergManifestPartitionRowGroup::AddFileStatistics(data_file, columns, metadata, table, result);
 	}
-
-	PartitionStatistics partition_stats;
-	partition_stats.count = count;
-	partition_stats.count_type = CountType::COUNT_EXACT;
-	result.push_back(partition_stats);
 }
 
 void IcebergPredicateStats::SetLowerBound(const Value &new_lower_bound) {

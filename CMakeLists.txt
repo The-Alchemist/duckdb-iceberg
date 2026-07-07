@@ -99,6 +99,7 @@ set(EXTENSION_SOURCES
 	src/function/scan/iceberg_scan.cpp
 	src/iceberg_extension.cpp
 	src/iceberg_logging.cpp
+	src/planning/iceberg_manifest_partition_row_group.cpp
 	src/planning/iceberg_multi_file_list.cpp
 	src/planning/iceberg_multi_file_reader.cpp
 	src/planning/iceberg_optimizer.cpp

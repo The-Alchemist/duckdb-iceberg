@@ -1,0 +1,33 @@
+# name: test/sql/local/iceberg_scans/manifest_min_max_aggregate_deletes.test
+# description: Delete manifests disable manifest stats, so aggregates must scan data files
+# group: [iceberg_scans]
+
+require avro
+
+require parquet
+
+require iceberg
+
+require httpfs
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+# Persistent table with both DATA and DELETE manifests (no generated-data env required).
+statement ok
+CREATE VIEW deletes_table AS SELECT * FROM iceberg_scan('{WORKING_DIRECTORY}/data/persistent/moved_positional_delete_path', allow_moved_paths=true);
+
+query I
+SELECT count(*) FROM deletes_table;
+----
+13136
+
+query II
+EXPLAIN SELECT count(*) FROM deletes_table;
+----
+physical_plan	<REGEX>:.*ICEBERG_SCAN.*
+
+query II
+EXPLAIN SELECT count(*) FROM deletes_table;
+----
+physical_plan	<!REGEX>:.*COLUMN_DATA_SCAN.*

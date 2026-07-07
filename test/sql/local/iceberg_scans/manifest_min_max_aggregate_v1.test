@@ -1,0 +1,30 @@
+# name: test/sql/local/iceberg_scans/manifest_min_max_aggregate_v1.test
+# description: Iceberg v1 tables emit no manifest partition stats, so MIN/MAX must scan
+# group: [iceberg_scans]
+
+require avro
+
+require parquet
+
+require iceberg
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE VIEW v1_table AS SELECT * FROM iceberg_scan('data/persistent/iceberg_v1_repro/repro/merch_v1/metadata/00003-8d01e4aa-d143-49c9-898e-b5e477577b70.metadata.json');
+
+query I
+SELECT max(id) FROM v1_table;
+----
+6
+
+query II
+EXPLAIN SELECT max(id) FROM v1_table;
+----
+physical_plan	<REGEX>:.*ICEBERG_SCAN.*
+
+query II
+EXPLAIN SELECT max(id) FROM v1_table;
+----
+physical_plan	<!REGEX>:.*COLUMN_DATA_SCAN.*
