@@ -8,6 +8,8 @@ require parquet
 
 require iceberg
 
+require icu
+
 statement ok
 SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
 
@@ -166,6 +168,31 @@ physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
 
 query II
 EXPLAIN SELECT max(ts) FROM ts_fold;
+----
+physical_plan	<!REGEX>:.*ICEBERG_SCAN.*
+
+# Multi-file TIMESTAMPTZ table written at runtime should fully fold MAX(ts).
+statement ok
+SET TimeZone='UTC';
+
+statement ok
+COPY (SELECT (range)::BIGINT AS id, ('2024-01-01'::TIMESTAMPTZ + (range::BIGINT * interval '1 second')) AS ts FROM range(3000000)) TO '{TEST_DIR}/manifest_tstz_fold' (FORMAT ICEBERG);
+
+statement ok
+CREATE VIEW tstz_fold AS SELECT ts FROM iceberg_scan('{TEST_DIR}/manifest_tstz_fold');
+
+query I
+SELECT max(ts) FROM tstz_fold;
+----
+2024-02-04 17:19:59+00
+
+query II
+EXPLAIN SELECT max(ts) FROM tstz_fold;
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+query II
+EXPLAIN SELECT max(ts) FROM tstz_fold;
 ----
 physical_plan	<!REGEX>:.*ICEBERG_SCAN.*
 
