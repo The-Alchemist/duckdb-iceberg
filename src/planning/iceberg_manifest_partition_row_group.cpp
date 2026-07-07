@@ -58,8 +58,8 @@ unique_ptr<BaseStatistics> BuildStatsFromManifestBounds(const LogicalType &type,
 
 } // namespace
 
-IcebergManifestPartitionRowGroup::IcebergManifestPartitionRowGroup(
-    unordered_map<idx_t, BaseStatistics> column_stats_p, unordered_map<idx_t, LogicalType> column_types_p)
+IcebergManifestPartitionRowGroup::IcebergManifestPartitionRowGroup(unordered_map<idx_t, BaseStatistics> column_stats_p,
+                                                                   unordered_map<idx_t, LogicalType> column_types_p)
     : column_stats(std::move(column_stats_p)), column_types(std::move(column_types_p)) {
 }
 
