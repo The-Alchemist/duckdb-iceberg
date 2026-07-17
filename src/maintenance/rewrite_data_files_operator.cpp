@@ -87,7 +87,8 @@ string LogicalRewriteDataFiles::GetName() const {
 }
 
 PhysicalOperator &LogicalRewriteDataFiles::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
-	auto &rewrite = planner.Make<PhysicalRewriteDataFiles>(std::move(plan), estimated_cardinality);
+	auto &rewrite =
+	    planner.Make<PhysicalRewriteDataFiles>(std::move(plan), estimated_cardinality).Cast<PhysicalRewriteDataFiles>();
 	if (children.empty()) {
 		return rewrite;
 	}
@@ -132,9 +133,9 @@ PhysicalOperator &LogicalRewriteDataFiles::CreatePlan(ClientContext &context, Ph
 			for (auto &order : sort_orders) {
 				group_orders.push_back(order.Copy());
 			}
-			optional_ptr<PhysicalOperator> copy_input = copy.children[0];
-			IcebergWriteSort::GeneratePhysicalOrder(planner, group_orders, copy_input);
-			copy.children[0] = *copy_input;
+			optional_ptr<PhysicalOperator> copy_child = &copy.children[0].get();
+			IcebergWriteSort::GeneratePhysicalOrder(planner, group_orders, copy_child);
+			copy.children[0] = *copy_child;
 		}
 		auto child_types = child_plan.GetTypes();
 
