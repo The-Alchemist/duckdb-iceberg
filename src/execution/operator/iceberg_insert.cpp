@@ -417,8 +417,8 @@ static void GeneratePartitionExpressions(ClientContext &context, const IcebergCo
 		}
 		partition_columns.push_back(partition_column_start++);
 
-		auto expr =
-		    IcebergWriteSort::GetTransformExpression(context, copy_input, field.source_id, field.transform, "partitioning");
+		auto expr = IcebergWriteSort::GetTransformExpression(context, copy_input, field.source_id, field.transform,
+		                                                     "partitioning");
 		projection_names.push_back(Identifier(field.GetPartitionSpecFieldName()));
 		projection_types.push_back(expr->GetReturnType());
 		projection_expressions.push_back(std::move(expr));
