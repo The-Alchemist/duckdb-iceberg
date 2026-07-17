@@ -1,0 +1,129 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/rewrite_data_files_sorted.test
+# description: rewrite_data_files applies table sort order on unpartitioned tables
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require avro
+
+require parquet
+
+require iceberg
+
+require httpfs
+
+require icu
+
+statement ok
+SET Calendar='gregorian';
+
+statement ok
+SET TimeZone='UTC';
+
+set ignore_error_messages
+
+statement ok
+set threads=1;
+
+statement ok
+drop table if exists my_datalake.default.rewrite_sorted;
+
+statement ok
+create table my_datalake.default.rewrite_sorted (
+	id INTEGER,
+	last_updated TIMESTAMPTZ,
+	payload VARCHAR
+);
+
+statement ok
+alter table my_datalake.default.rewrite_sorted
+set sorted by (last_updated asc nulls last, id asc nulls last);
+
+statement ok
+set variable table_sort_order_id = (
+	select metadata."default-sort-order-id"
+	from iceberg_load_table_response(my_datalake.default.rewrite_sorted)
+);
+
+# Write unsorted-looking inserts as separate files (sort applied on each insert,
+# but we still get many small files to compact).
+statement ok
+insert into my_datalake.default.rewrite_sorted values
+	(5, '2020-05-01 00:00:00+00', 'e');
+
+statement ok
+insert into my_datalake.default.rewrite_sorted values
+	(2, '2020-02-01 00:00:00+00', 'b');
+
+statement ok
+insert into my_datalake.default.rewrite_sorted values
+	(4, '2020-04-01 00:00:00+00', 'd');
+
+statement ok
+insert into my_datalake.default.rewrite_sorted values
+	(1, '2020-01-01 00:00:00+00', 'a');
+
+statement ok
+insert into my_datalake.default.rewrite_sorted values
+	(3, '2020-03-01 00:00:00+00', 'c');
+
+statement ok
+insert into my_datalake.default.rewrite_sorted values
+	(6, '2020-06-01 00:00:00+00', 'f');
+
+query III
+call iceberg_rewrite_data_files('my_datalake.default.rewrite_sorted', rewrite_all => true);
+----
+6	1	<REGEX>:[1-9][0-9]*
+
+statement ok
+set variable latest_manifest_sequence = (
+	select max(manifest_sequence_number)
+	from iceberg_metadata(my_datalake.default.rewrite_sorted)
+);
+
+statement ok
+set variable rewritten_file = (
+	select file_path
+	from iceberg_metadata(my_datalake.default.rewrite_sorted)
+	where manifest_sequence_number = cast(getvariable('latest_manifest_sequence') as bigint)
+	and manifest_content = 'DATA'
+	and status = 'ADDED'
+	limit 1
+);
+
+statement ok
+set variable manifest_path = (
+	select manifest_path
+	from iceberg_metadata(my_datalake.default.rewrite_sorted)
+	where manifest_sequence_number = cast(getvariable('latest_manifest_sequence') as bigint)
+	and manifest_content = 'DATA'
+	and status = 'ADDED'
+	limit 1
+);
+
+# Physical row order in the rewritten file follows the table sort order.
+query ITT
+select id, last_updated, payload
+from my_datalake.default.rewrite_sorted
+where filename = getvariable('rewritten_file')
+order by file_row_number;
+----
+1	2020-01-01 00:00:00+00	a
+2	2020-02-01 00:00:00+00	b
+3	2020-03-01 00:00:00+00	c
+4	2020-04-01 00:00:00+00	d
+5	2020-05-01 00:00:00+00	e
+6	2020-06-01 00:00:00+00	f
+
+query I
+select min(sort_order_id) = cast(getvariable('table_sort_order_id') as integer)
+and max(sort_order_id) = cast(getvariable('table_sort_order_id') as integer)
+from (select unnest(data_file) from read_avro(getvariable('manifest_path')))
+where file_path = getvariable('rewritten_file')
+and sort_order_id is not null;
+----
+1
+
+statement ok
+drop table if exists my_datalake.default.rewrite_sorted;

@@ -8,19 +8,17 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
-#include "duckdb/execution/operator/order/physical_order.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
-#include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include "catalog/rest/iceberg_catalog.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
+#include "execution/iceberg_write_sort.hpp"
 #include "execution/operator/iceberg_delete.hpp"
 #include "execution/operator/physical_iceberg_create_table.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_information.hpp"
@@ -104,15 +102,6 @@ unique_ptr<GlobalSinkState> IcebergInsert::GetGlobalSinkState(ClientContext &con
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
-
-static vector<idx_t> GetColumnPath(const ColumnIndex &column_index) {
-	vector<idx_t> path;
-	path.reserve(column_index.ChildIndexCount());
-	for (auto &child_index : column_index.GetChildIndexes()) {
-		path.push_back(child_index.GetPrimaryIndex());
-	}
-	return path;
-}
 
 static ColumnIndex GetColumnIndexBySourceId(const IcebergTableSchema &schema, idx_t source_id) {
 	auto column_index = schema.TryGetColumnIndexByFieldId(source_id);
@@ -371,150 +360,6 @@ static Value WrittenFieldIds(const IcebergCopyInput &copy_input) {
 // Partition Expression Generation
 //===--------------------------------------------------------------------===//
 
-//! Create a column reference expression for the given column index
-static unique_ptr<Expression> CreateColumnReference(const IcebergCopyInput &copy_input, const LogicalType &type,
-                                                    idx_t column_index) {
-	if (copy_input.get_table_index.IsValid()) {
-		// logical plan generation: generate a bound column ref
-		ColumnBinding column_binding(TableIndex(copy_input.get_table_index.GetIndex()), ProjectionIndex(column_index));
-		return make_uniq<BoundColumnRefExpression>(type, column_binding);
-	}
-	// physical plan generation: generate a reference directly
-	return make_uniq<BoundReferenceExpression>(type, column_index);
-}
-
-static unique_ptr<Expression> CreateSourceColumnReference(ClientContext &context, const IcebergCopyInput &copy_input,
-                                                          uint64_t source_id) {
-	auto column_index = GetColumnIndexBySourceId(copy_input.schema, source_id);
-	auto primary_index = column_index.GetPrimaryIndex();
-	auto &root_column = *copy_input.schema.columns[primary_index];
-	auto result = CreateColumnReference(copy_input, root_column.type, primary_index);
-	for (auto &child_index : GetColumnPath(column_index)) {
-		vector<unique_ptr<Expression>> children;
-		children.push_back(std::move(result));
-		children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(child_index + 1))));
-
-		ErrorData error;
-		FunctionBinder binder(context);
-		result = binder.BindScalarFunction(Identifier::DefaultSchema(), Identifier("struct_extract_at"),
-		                                   std::move(children), error, false);
-		if (!result) {
-			error.Throw();
-		}
-	}
-	return result;
-}
-
-static unique_ptr<Expression> BindTransformFunction(ClientContext &context, const string &name,
-                                                    vector<unique_ptr<Expression>> children) {
-	ErrorData error;
-	FunctionBinder binder(context);
-	auto function =
-	    binder.BindScalarFunction(Identifier::DefaultSchema(), Identifier(name), std::move(children), error, false);
-	if (!function) {
-		error.Throw();
-	}
-	return function;
-}
-
-//! Iceberg partition/sort transforms for year/month/day/hour are defined as:
-//! - years: date_diff('year', DATE '1970-01-01', source_column)
-//! - months: date_diff('month', DATE '1970-01-01', source_column)
-//! - days: date_diff('day', DATE '1970-01-01', source_column)
-//! - hours: date_diff('hour', TIMESTAMP '1970-01-01', source_column)
-static unique_ptr<Expression> GetDateDiffFunction(ClientContext &context, const IcebergCopyInput &copy_input,
-                                                  const string &date_part, uint64_t source_id) {
-	vector<unique_ptr<Expression>> children;
-	children.push_back(make_uniq<BoundConstantExpression>(Value(date_part)));
-	if (date_part == "hour") {
-		children.push_back(make_uniq<BoundConstantExpression>(Value::TIMESTAMP(Timestamp::FromEpochSeconds(0))));
-	} else {
-		children.push_back(make_uniq<BoundConstantExpression>(Value::DATE(Date::FromDate(1970, 1, 1))));
-	}
-	children.push_back(CreateSourceColumnReference(context, copy_input, source_id));
-	return BindTransformFunction(context, "date_diff", std::move(children));
-}
-
-static unique_ptr<Expression> GetBucketExpression(ClientContext &context, const IcebergCopyInput &copy_input,
-                                                  uint64_t source_id, const IcebergTransform &transform) {
-	vector<unique_ptr<Expression>> children;
-	children.push_back(
-	    make_uniq<BoundConstantExpression>(Value::INTEGER(static_cast<int32_t>(transform.GetBucketModulo()))));
-	children.push_back(CreateSourceColumnReference(context, copy_input, source_id));
-	return BindTransformFunction(context, "iceberg_bucket", std::move(children));
-}
-
-static unique_ptr<Expression> GetTruncateExpression(ClientContext &context, const IcebergCopyInput &copy_input,
-                                                    uint64_t source_id, const IcebergTransform &transform) {
-	vector<unique_ptr<Expression>> children;
-	children.push_back(
-	    make_uniq<BoundConstantExpression>(Value::INTEGER(static_cast<int32_t>(transform.GetTruncateWidth()))));
-	children.push_back(CreateSourceColumnReference(context, copy_input, source_id));
-	return BindTransformFunction(context, "iceberg_truncate", std::move(children));
-}
-
-static unique_ptr<Expression> GetTransformExpression(ClientContext &context, const IcebergCopyInput &copy_input,
-                                                     uint64_t source_id, const IcebergTransform &transform,
-                                                     const char *usage) {
-	switch (transform.Type()) {
-	case IcebergTransformType::IDENTITY: {
-		return CreateSourceColumnReference(context, copy_input, source_id);
-	}
-	case IcebergTransformType::YEAR:
-		return GetDateDiffFunction(context, copy_input, "year", source_id);
-	case IcebergTransformType::MONTH:
-		return GetDateDiffFunction(context, copy_input, "month", source_id);
-	case IcebergTransformType::DAY:
-		return GetDateDiffFunction(context, copy_input, "day", source_id);
-	case IcebergTransformType::HOUR:
-		return GetDateDiffFunction(context, copy_input, "hour", source_id);
-	case IcebergTransformType::BUCKET:
-		return GetBucketExpression(context, copy_input, source_id, transform);
-	case IcebergTransformType::TRUNCATE:
-		return GetTruncateExpression(context, copy_input, source_id, transform);
-	case IcebergTransformType::VOID:
-		throw InvalidInputException("VOID partition transform should not be used for %s", usage);
-	default:
-		throw NotImplementedException("Unsupported %s transform type", usage);
-	}
-}
-
-static OrderType GetDuckDBOrderType(const string &direction) {
-	if (StringUtil::CIEquals(direction, "asc")) {
-		return OrderType::ASCENDING;
-	}
-	if (StringUtil::CIEquals(direction, "desc")) {
-		return OrderType::DESCENDING;
-	}
-	throw NotImplementedException("Unsupported Iceberg sort direction '%s'", direction);
-}
-
-static OrderByNullType GetDuckDBNullOrder(const string &null_order) {
-	if (StringUtil::CIEquals(null_order, "nulls-first")) {
-		return OrderByNullType::NULLS_FIRST;
-	}
-	if (StringUtil::CIEquals(null_order, "nulls-last")) {
-		return OrderByNullType::NULLS_LAST;
-	}
-	throw NotImplementedException("Unsupported Iceberg null order '%s'", null_order);
-}
-
-static void GenerateSortOrderExpressions(ClientContext &context, const IcebergCopyInput &copy_input,
-                                         IcebergCopyOptions &result) {
-	if (!copy_input.table_metadata.HasSortOrder()) {
-		return;
-	}
-	auto &sort_order = copy_input.table_metadata.GetLatestSortOrder();
-	if (!sort_order.IsSorted()) {
-		return;
-	}
-	for (auto &field : sort_order.fields) {
-		auto expr = GetTransformExpression(context, copy_input, field.source_id, field.transform, "sorting");
-		result.order_columns.emplace_back(GetDuckDBOrderType(field.direction), GetDuckDBNullOrder(field.null_order),
-		                                  std::move(expr));
-	}
-}
-
 //! Generate partition expressions and configure copy options for partitioned writes
 static void GeneratePartitionExpressions(ClientContext &context, const IcebergCopyInput &copy_input,
                                          IcebergCopyOptions &result) {
@@ -558,7 +403,7 @@ static void GeneratePartitionExpressions(ClientContext &context, const IcebergCo
 	// Pass-through projections for physical columns
 	idx_t col_idx = 0;
 	for (auto &col : copy_input.schema.columns) {
-		projection_expressions.push_back(CreateColumnReference(copy_input, col->type, col_idx++));
+		projection_expressions.push_back(IcebergWriteSort::CreateColumnReference(copy_input, col->type, col_idx++));
 	}
 	// Pass-through projections for virtual columns
 	for (idx_t v = 0; v < virtual_column_count; v++) {
@@ -572,7 +417,8 @@ static void GeneratePartitionExpressions(ClientContext &context, const IcebergCo
 		}
 		partition_columns.push_back(partition_column_start++);
 
-		auto expr = GetTransformExpression(context, copy_input, field.source_id, field.transform, "partitioning");
+		auto expr =
+		    IcebergWriteSort::GetTransformExpression(context, copy_input, field.source_id, field.transform, "partitioning");
 		projection_names.push_back(Identifier(field.GetPartitionSpecFieldName()));
 		projection_types.push_back(expr->GetReturnType());
 		projection_expressions.push_back(std::move(expr));
@@ -668,7 +514,7 @@ IcebergCopyOptions IcebergInsert::GetCopyOptions(ClientContext &context, const I
 	// Get Parquet Copy function
 	auto &copy_fun = IcebergUtils::GetCopyFunction(context, file_format);
 	IcebergCopyOptions result(std::move(info), copy_fun.function);
-	GenerateSortOrderExpressions(context, copy_input, result);
+	IcebergWriteSort::PopulateCopyOrderColumns(context, copy_input, result);
 
 	result.filename_pattern.SetFilenamePattern("{uuidv7}");
 	auto write_target_file_size = table_properties.find("write.target-file-size-bytes");
@@ -744,20 +590,6 @@ static void GenerateProjection(ClientContext &context, PhysicalPlanGenerator &pl
 	plan = proj;
 }
 
-static void GeneratePhysicalOrder(PhysicalPlanGenerator &planner, vector<BoundOrderByNode> &orders,
-                                  optional_ptr<PhysicalOperator> &plan) {
-	D_ASSERT(plan);
-	vector<idx_t> projections;
-	projections.reserve(plan->GetTypes().size());
-	for (idx_t i = 0; i < plan->GetTypes().size(); i++) {
-		projections.push_back(i);
-	}
-	auto &order = planner.Make<PhysicalOrder>(plan->GetTypes(), std::move(orders), std::move(projections),
-	                                          plan->estimated_cardinality);
-	order.children.push_back(*plan);
-	plan = order;
-}
-
 PhysicalOperator &IcebergInsert::PlanCopyForInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                                    const IcebergCopyInput &copy_input,
                                                    optional_ptr<PhysicalOperator> plan) {
@@ -770,7 +602,7 @@ PhysicalOperator &IcebergInsert::PlanCopyForInsert(ClientContext &context, Physi
 	}
 
 	if (!copy_input.partition_spec && !copy_options.order_columns.empty() && plan) {
-		GeneratePhysicalOrder(planner, copy_options.order_columns, plan);
+		IcebergWriteSort::GeneratePhysicalOrder(planner, copy_options.order_columns, plan);
 	}
 
 	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);

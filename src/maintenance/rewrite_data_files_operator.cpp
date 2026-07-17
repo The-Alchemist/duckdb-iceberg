@@ -1,16 +1,23 @@
 #include "maintenance/rewrite_data_files_operator.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/enums/physical_operator_type.hpp"
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/set/physical_union.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
 
 #include "catalog/rest/catalog_entry/table/iceberg_table_information.hpp"
+#include "core/metadata/iceberg_table_metadata.hpp"
+#include "core/metadata/schema/iceberg_table_schema.hpp"
+#include "execution/iceberg_write_sort.hpp"
+#include "execution/operator/iceberg_insert.hpp"
 #include "maintenance/maintenance_table_loader.hpp"
 #include "maintenance/rewrite_data_files_executor.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/execution/operator/projection/physical_projection.hpp"
 
 namespace duckdb {
 
@@ -85,10 +92,50 @@ PhysicalOperator &LogicalRewriteDataFiles::CreatePlan(ClientContext &context, Ph
 		return rewrite;
 	}
 
+	//! Apply the table's default sort order to each rewrite COPY, matching
+	//! IcebergInsert's unpartitioned sorted-write path (PhysicalOrder before COPY).
+	vector<BoundOrderByNode> sort_orders;
+	if (rewrite.plan.table_info) {
+		auto &table_metadata = rewrite.plan.table_info->table_metadata;
+		auto schema_id = table_metadata.GetCurrentSchemaId();
+		auto schema_it = table_metadata.GetSchemas().find(schema_id);
+		if (schema_it == table_metadata.GetSchemas().end()) {
+			throw InternalException("iceberg_rewrite_data_files: current schema id %d not found in metadata",
+			                        schema_id);
+		}
+		IcebergCopyInput copy_input(context, table_metadata, *schema_it->second);
+		//! Rewrite COPYs are unpartitioned from COPY's perspective (partition
+		//! values are stamped from the rewrite group). Build physical BoundReference
+		//! sort keys over the SELECT * schema.
+		copy_input.partition_spec = nullptr;
+		sort_orders = IcebergWriteSort::GenerateSortOrderExpressions(context, copy_input);
+		rewrite.plan.applied_sort_order = !sort_orders.empty();
+	}
+
 	ArenaLinkedList<reference<PhysicalOperator>> physical_children(planner.ArenaRef());
 	for (idx_t group_idx = 0; group_idx < children.size(); group_idx++) {
 		auto &child = children[group_idx];
 		auto &child_plan = planner.CreatePlan(*child);
+		if (rewrite.plan.applied_sort_order) {
+			if (child_plan.type != PhysicalOperatorType::COPY_TO_FILE) {
+				throw InternalException(
+				    "iceberg_rewrite_data_files: expected PhysicalCopyToFile as rewrite group root, found %s",
+				    PhysicalOperatorToString(child_plan.type));
+			}
+			auto &copy = child_plan.Cast<PhysicalCopyToFile>();
+			if (copy.children.empty()) {
+				throw InternalException("iceberg_rewrite_data_files: PhysicalCopyToFile has no child to sort");
+			}
+			//! Clone sort keys per group — GeneratePhysicalOrder moves the vector.
+			vector<BoundOrderByNode> group_orders;
+			group_orders.reserve(sort_orders.size());
+			for (auto &order : sort_orders) {
+				group_orders.push_back(order.Copy());
+			}
+			optional_ptr<PhysicalOperator> copy_input = copy.children[0];
+			IcebergWriteSort::GeneratePhysicalOrder(planner, group_orders, copy_input);
+			copy.children[0] = *copy_input;
+		}
 		auto child_types = child_plan.GetTypes();
 
 		vector<unique_ptr<Expression>> projection_expressions;
@@ -175,7 +222,8 @@ SinkResultType PhysicalRewriteDataFiles::Sink(ExecutionContext &context, DataChu
 		auto &table_info = *gstate.plan.table_info;
 		auto entry = BuildRewriteManifestEntry(
 		    gstate.context, group, gstate.plan.starting_sequence_number, count, produced_file, file_size_in_bytes,
-		    column_stats, table_info.table_metadata, gstate.plan.table_name.Name().GetIdentifierName());
+		    column_stats, table_info.table_metadata, gstate.plan.table_name.Name().GetIdentifierName(),
+		    gstate.plan.applied_sort_order);
 
 		{
 			lock_guard<mutex> guard(gstate.lock);

@@ -1,0 +1,169 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/rewrite_data_files_partitioned_sorted.test
+# description: rewrite_data_files sorts within PARTITIONED BY (project_id) groups by last_updated
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require avro
+
+require parquet
+
+require iceberg
+
+require httpfs
+
+require icu
+
+statement ok
+SET Calendar='gregorian';
+
+statement ok
+SET TimeZone='UTC';
+
+set ignore_error_messages
+
+statement ok
+set threads=1;
+
+statement ok
+drop table if exists my_datalake.default.rewrite_partitioned_sorted;
+
+statement ok
+create table my_datalake.default.rewrite_partitioned_sorted (
+	project_id UUID,
+	last_updated TIMESTAMPTZ,
+	payload VARCHAR
+)
+partitioned by (project_id);
+
+statement ok
+alter table my_datalake.default.rewrite_partitioned_sorted
+set sorted by (last_updated asc nulls last);
+
+statement ok
+set variable table_sort_order_id = (
+	select metadata."default-sort-order-id"
+	from iceberg_load_table_response(my_datalake.default.rewrite_partitioned_sorted)
+);
+
+statement ok
+set variable project_a = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'::UUID;
+
+statement ok
+set variable project_b = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'::UUID;
+
+# Many small files for project_a (the compaction target), plus a second project.
+statement ok
+insert into my_datalake.default.rewrite_partitioned_sorted values
+	(getvariable('project_a'), '2020-05-01 00:00:00+00', 'a5');
+
+statement ok
+insert into my_datalake.default.rewrite_partitioned_sorted values
+	(getvariable('project_a'), '2020-02-01 00:00:00+00', 'a2');
+
+statement ok
+insert into my_datalake.default.rewrite_partitioned_sorted values
+	(getvariable('project_a'), '2020-04-01 00:00:00+00', 'a4');
+
+statement ok
+insert into my_datalake.default.rewrite_partitioned_sorted values
+	(getvariable('project_a'), '2020-01-01 00:00:00+00', 'a1');
+
+statement ok
+insert into my_datalake.default.rewrite_partitioned_sorted values
+	(getvariable('project_a'), '2020-03-01 00:00:00+00', 'a3');
+
+statement ok
+insert into my_datalake.default.rewrite_partitioned_sorted values
+	(getvariable('project_b'), '2021-01-01 00:00:00+00', 'b1');
+
+query III
+call iceberg_rewrite_data_files('my_datalake.default.rewrite_partitioned_sorted', rewrite_all => true);
+----
+6	2	<REGEX>:[1-9][0-9]*
+
+statement ok
+set variable latest_manifest_sequence = (
+	select max(manifest_sequence_number)
+	from iceberg_metadata(my_datalake.default.rewrite_partitioned_sorted)
+);
+
+statement ok
+set variable project_a_file = (
+	select filename
+	from my_datalake.default.rewrite_partitioned_sorted
+	where project_id = getvariable('project_a')
+	and filename in (
+		select file_path
+		from iceberg_metadata(my_datalake.default.rewrite_partitioned_sorted)
+		where manifest_sequence_number = cast(getvariable('latest_manifest_sequence') as bigint)
+		and manifest_content = 'DATA'
+		and status = 'ADDED'
+	)
+	limit 1
+);
+
+statement ok
+set variable manifest_path = (
+	select manifest_path
+	from iceberg_metadata(my_datalake.default.rewrite_partitioned_sorted)
+	where manifest_sequence_number = cast(getvariable('latest_manifest_sequence') as bigint)
+	and manifest_content = 'DATA'
+	and status = 'ADDED'
+	limit 1
+);
+
+# Within the compacted project_a file, rows are ordered by last_updated.
+query TT
+select last_updated, payload
+from my_datalake.default.rewrite_partitioned_sorted
+where filename = getvariable('project_a_file')
+order by file_row_number;
+----
+2020-01-01 00:00:00+00	a1
+2020-02-01 00:00:00+00	a2
+2020-03-01 00:00:00+00	a3
+2020-04-01 00:00:00+00	a4
+2020-05-01 00:00:00+00	a5
+
+query I
+with latest_files as (
+	select file_path
+	from iceberg_metadata(my_datalake.default.rewrite_partitioned_sorted)
+	where manifest_sequence_number = cast(getvariable('latest_manifest_sequence') as bigint)
+	and manifest_content = 'DATA'
+	and status = 'ADDED'
+),
+ordered_rows as (
+	select
+		filename,
+		file_row_number,
+		last_updated,
+		lag(last_updated) over(partition by filename order by file_row_number) prev_ts
+	from my_datalake.default.rewrite_partitioned_sorted
+	where filename in (select file_path from latest_files)
+)
+select count(*)
+from ordered_rows
+where prev_ts is not null
+and last_updated < prev_ts;
+----
+0
+
+query I
+select min(sort_order_id) = cast(getvariable('table_sort_order_id') as integer)
+and max(sort_order_id) = cast(getvariable('table_sort_order_id') as integer)
+from (select unnest(data_file) from read_avro(getvariable('manifest_path')))
+where file_path in (
+	select file_path
+	from iceberg_metadata(my_datalake.default.rewrite_partitioned_sorted)
+	where manifest_sequence_number = cast(getvariable('latest_manifest_sequence') as bigint)
+	and manifest_content = 'DATA'
+	and status = 'ADDED'
+)
+and sort_order_id is not null;
+----
+1
+
+statement ok
+drop table if exists my_datalake.default.rewrite_partitioned_sorted;

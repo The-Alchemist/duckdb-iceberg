@@ -31,6 +31,8 @@ struct RewritePlan {
 	vector<RewriteCandidate> candidates;
 	//! Partition-local rewrite groups.
 	vector<vector<RewriteCandidate>> file_groups;
+	//! True when rewrite COPY plans apply the table's default sort order.
+	bool applied_sort_order = false;
 };
 
 struct RewriteDataFilesPlanInput {

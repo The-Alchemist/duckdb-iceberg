@@ -79,6 +79,30 @@ explain analyze select * from my_datalake.default.rewrite_commit_basic;
 ----
 analyzed_plan	<REGEX>:.*Total Files Read: 1.*
 
+# Unsorted tables must not stamp sort_order_id on rewritten files.
+statement ok
+set variable latest_manifest_sequence = (
+	select max(manifest_sequence_number)
+	from iceberg_metadata(my_datalake.default.rewrite_commit_basic)
+);
+
+statement ok
+set variable rewritten_manifest = (
+	select manifest_path
+	from iceberg_metadata(my_datalake.default.rewrite_commit_basic)
+	where manifest_sequence_number = cast(getvariable('latest_manifest_sequence') as bigint)
+	and manifest_content = 'DATA'
+	and status = 'ADDED'
+	limit 1
+);
+
+query I
+select count(*)
+from (select unnest(data_file) from read_avro(getvariable('rewritten_manifest')))
+where sort_order_id is not null;
+----
+0
+
 # Re-running the action is a no-op: only one input file remains, which is below
 # `min_input_files`. Zero rewritten files.
 query III

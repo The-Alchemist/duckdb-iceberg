@@ -18,7 +18,7 @@ IcebergManifestEntry BuildRewriteManifestEntry(ClientContext &context, const vec
                                                int64_t starting_sequence_number, int64_t record_count,
                                                const string &produced_file, int64_t file_size_in_bytes,
                                                const Value &column_stats, const IcebergTableMetadata &table_metadata,
-                                               const string &table_name) {
+                                               const string &table_name, bool applied_sort_order) {
 	if (group.empty()) {
 		throw InternalException("iceberg_rewrite_data_files: cannot build a manifest entry for an empty group");
 	}
@@ -35,7 +35,8 @@ IcebergManifestEntry BuildRewriteManifestEntry(ClientContext &context, const vec
 	//! The planner buckets candidates so every file in one group shares the same
 	//! partition tuple. Reuse candidate 0 instead of re-deriving it.
 	entry.data_file.partition_info = group.front().partition_info;
-	if (table_metadata.HasSortOrder()) {
+	//! Only claim a sort order when rewrite actually sorted the output rows.
+	if (applied_sort_order && table_metadata.HasSortOrder()) {
 		auto &sort_order = table_metadata.GetLatestSortOrder();
 		if (sort_order.IsSorted()) {
 			entry.data_file.sort_order_id = sort_order.sort_order_id;
