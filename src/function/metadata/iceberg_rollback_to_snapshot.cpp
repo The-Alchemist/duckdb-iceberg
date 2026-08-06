@@ -6,7 +6,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 
-#include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
+#include "catalog/rest/catalog_entry/table/iceberg_table.hpp"
+#include "catalog/rest/catalog_entry/table/iceberg_table_schema_version.hpp"
 #include "catalog/rest/transaction/iceberg_transaction.hpp"
 #include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 #include "common/iceberg_utils.hpp"
@@ -18,7 +19,7 @@ namespace duckdb {
 namespace {
 
 struct IcebergRollbackToSnapshotBindData : public TableFunctionData {
-	optional_ptr<IcebergTableEntry> iceberg_table;
+	optional_ptr<IcebergTableSchemaVersion> iceberg_table;
 	int64_t snapshot_id = 0;
 };
 
@@ -75,7 +76,7 @@ static unique_ptr<FunctionData> IcebergRollbackToSnapshotBind(ClientContext &con
 	if (!CheckTableIsIcebergTable(iceberg_table)) {
 		throw InvalidInputException("Cannot call iceberg_rollback_to_snapshot on non-iceberg table");
 	}
-	ret->iceberg_table = iceberg_table->Cast<IcebergTableEntry>();
+	ret->iceberg_table = iceberg_table->Cast<IcebergTableSchemaVersion>();
 	// Accept BIGINT / UBIGINT from iceberg_snapshots without overflowing signed range unexpectedly.
 	auto snapshot_value = input.inputs[1].DefaultCastAs(LogicalType::BIGINT);
 	ret->snapshot_id = snapshot_value.GetValue<int64_t>();

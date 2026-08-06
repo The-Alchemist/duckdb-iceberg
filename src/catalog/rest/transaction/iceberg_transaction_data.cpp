@@ -418,11 +418,8 @@ void IcebergTransactionData::TableRollbackToSnapshot(int64_t snapshot_id) {
 	requirements.push_back(make_uniq<AssertRefSnapshotId>(current_snapshot_id));
 	updates.push_back(make_uniq<SetSnapshotRef>(snapshot_id));
 
-	// Align current schema with the target snapshot when it differs.
-	auto target_schema_id = target->GetSchemaId();
-	if (target_schema_id != metadata.GetCurrentSchemaId()) {
-		pending_current_schema_id = target_schema_id;
-	}
+	// Iceberg intentionally does not roll current-schema-id back with the snapshot;
+	// schema evolution stays forward-only. See https://github.com/apache/iceberg/issues/5591
 }
 
 } // namespace duckdb
