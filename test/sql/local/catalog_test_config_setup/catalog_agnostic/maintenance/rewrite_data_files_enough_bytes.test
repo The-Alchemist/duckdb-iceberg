@@ -1,0 +1,61 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/rewrite_data_files_enough_bytes.test
+# description: rewrite when fewer than min_input_files but total bytes meet the target
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require avro
+
+require parquet
+
+require iceberg
+
+require httpfs
+
+statement ok
+drop table if exists my_datalake.default.rewrite_enough_bytes;
+
+statement ok
+create table my_datalake.default.rewrite_enough_bytes (id INTEGER, payload VARCHAR);
+
+statement ok
+insert into my_datalake.default.rewrite_enough_bytes values (1, 'aaaaaaaaaa'), (2, 'bbbbbbbbbb');
+
+statement ok
+insert into my_datalake.default.rewrite_enough_bytes values (3, 'cccccccccc'), (4, 'dddddddddd');
+
+statement ok
+insert into my_datalake.default.rewrite_enough_bytes values (5, 'eeeeeeeeee'), (6, 'ffffffffff');
+
+query I
+select count(*)
+from iceberg_metadata('my_datalake.default.rewrite_enough_bytes')
+where content = 'DATA' and status <> 'DELETED';
+----
+3
+
+# Three files is below min_input_files=5. A tiny rewrite target makes their
+# combined size enough to rewrite anyway (Spark enough-content rule).
+query III
+call iceberg_rewrite_data_files(
+	'my_datalake.default.rewrite_enough_bytes',
+	target_file_size_bytes => 100,
+	min_input_files => 5
+);
+----
+3	<REGEX>:[1-9][0-9]*	<REGEX>:[1-9][0-9]*
+
+query I
+select count(*) from my_datalake.default.rewrite_enough_bytes;
+----
+6
+
+query I
+select count(*) > 0
+from iceberg_metadata('my_datalake.default.rewrite_enough_bytes')
+where content = 'DATA' and status <> 'DELETED';
+----
+true
+
+statement ok
+drop table if exists my_datalake.default.rewrite_enough_bytes;
