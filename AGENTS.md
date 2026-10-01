@@ -135,3 +135,14 @@ Keep `scripts/data_generators/integration_config.py`, the matching `make/catalog
 - Generator change: run the specific case with `TEST=<case> make <catalog>-data`; preserve registered skip/xfail semantics.
 - Config-only change: parse all JSON configs and run at least one test that resolves the active config if services are already available.
 - Documentation-only change: verify commands statically and do not start containers, clone catalog repositories, install dependencies, or remove generated data.
+
+## Cursor Cloud specific instructions
+
+These notes cover non-obvious startup/run caveats in the Cursor Cloud VM, where dependencies are already installed (submodules initialized, vcpkg present, Docker installed, `.venv-spark4` and generated fixture data on disk). They complement, and do not replace, the build/test guidance above.
+
+- vcpkg lives at `~/vcpkg` pinned to the CI commit `84bab45d415d22042bd0b9081aea57f362da3f35`. `VCPKG_TOOLCHAIN_PATH` is exported from `~/.bashrc` (points at `~/vcpkg/scripts/buildsystems/vcpkg.cmake`), so `make debug`/`make release` work in a fresh login shell without extra setup. Build with the clang toolchain and ninja: `GEN=ninja CC=clang CXX=clang++`.
+- `make debug` compiles with AddressSanitizer + UBSan. For ad-hoc runs of `./build/debug/duckdb` or `./build/debug/test/unittest`, set `ASAN_OPTIONS=detect_leaks=0` to avoid leak-check aborts on process exit (CI instead uses the leak suppression files referenced in `.github/workflows/test-*-catalog.yml`).
+- Load the locally built extension in the shell with `-unsigned` (e.g. `./build/debug/duckdb -unsigned`). `CREATE OR REPLACE TABLE` is not supported for Iceberg tables; use separate `DROP TABLE IF EXISTS` + `CREATE TABLE`.
+- Docker is installed but the daemon is not running at session start. Start it once per session: `sudo dockerd &` (the VM kernel needs the `fuse-overlayfs` storage driver and `iptables-legacy`, which are already configured in `/etc/docker/daemon.json`). The `ubuntu` user is in the `docker` group, so a fresh login shell can run `docker` without `sudo`.
+- The four REST-catalog `*-data` targets (e.g. `make fixture-data`) drive Docker Compose and PySpark; the fixture catalog is the simplest and is the CI smoke test. After it runs, the catalog is recorded in `.catalogs/.active_catalog` and containers listen on 8181 (REST) and 9000/9001 (MinIO). Catalog-backed unittests need `FIXTURE_SERVER_AVAILABLE=1` plus the resolved `--test-config` (see the catalog-backed test commands above).
+- Python integration tests are not isolated: read-only test files (e.g. `test/python/test_pyiceberg_read.py`) expect tables that other test files seed first, so they fail when run alone. Run the whole `test/python` suite, or run self-contained files that declare their own `SparkSeedTable` (e.g. `test/python/test_insert_end_to_end.py`).
