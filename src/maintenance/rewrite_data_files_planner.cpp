@@ -86,6 +86,9 @@ bool BucketQualifies(const RewriteBucket &bucket, const RewriteDataFilesPlanInpu
 }
 
 void ConsiderCandidate(RewriteBucket &bucket, RewriteCandidate cand, const RewriteDataFilesPlanInput &input) {
+	if (!input.only_paths.empty() && input.only_paths.count(cand.file_path) == 0) {
+		return;
+	}
 	//! Match Spark: rewrite undersized or oversized files; leave the band alone.
 	if (!input.rewrite_all && cand.file_size_in_bytes >= input.min_file_size_bytes.value() &&
 	    cand.file_size_in_bytes <= input.max_file_size_bytes.value()) {
@@ -117,14 +120,20 @@ void SelectFromBucket(RewritePlan &plan, RewriteBucket &bucket, const RewriteDat
 	if (!BucketQualifies(bucket, input, plan.target_file_size_bytes)) {
 		return;
 	}
+	RewriteFileGroup group;
 	for (auto &cand : bucket.retained) {
 		if (capped && remaining == 0) {
-			return;
+			break;
 		}
+		group.input_bytes += cand.file_size_in_bytes;
+		group.files.push_back(cand);
 		plan.selected_candidates.push_back(std::move(cand));
 		if (capped) {
 			remaining--;
 		}
+	}
+	if (!group.files.empty()) {
+		plan.file_groups.push_back(std::move(group));
 	}
 }
 
@@ -134,6 +143,31 @@ idx_t RemainingRewriteCap(const RewriteDataFilesPlanInput &input, bool &capped) 
 		return NumericCast<idx_t>(input.max_files_to_rewrite.value());
 	}
 	return NumericLimits<idx_t>::Maximum();
+}
+
+void OrderRewriteGroups(RewritePlan &plan) {
+	auto &order = plan.rewrite_job_order;
+	if (order != "none") {
+		std::stable_sort(plan.file_groups.begin(), plan.file_groups.end(),
+		                 [&](const RewriteFileGroup &a, const RewriteFileGroup &b) {
+			                 if (order == "bytes-asc") {
+				                 return a.input_bytes < b.input_bytes;
+			                 }
+			                 if (order == "bytes-desc") {
+				                 return a.input_bytes > b.input_bytes;
+			                 }
+			                 if (order == "files-asc") {
+				                 return a.files.size() < b.files.size();
+			                 }
+			                 return a.files.size() > b.files.size();
+		                 });
+	}
+	plan.selected_candidates.clear();
+	for (auto &group : plan.file_groups) {
+		for (auto &file : group.files) {
+			plan.selected_candidates.push_back(file);
+		}
+	}
 }
 
 void SelectCandidates(RewritePlan &plan, const RewriteDataFilesPlanInput &input, RewriteBucket &bucket) {
@@ -293,6 +327,11 @@ RewritePlan PlanRewrite(ClientContext &context, RewriteDataFilesPlanInput input)
 		                            "'max_file_size_bytes' (%lld)",
 		                            input.min_file_size_bytes.value(), input.max_file_size_bytes.value());
 	}
+	plan.partial_progress_enabled = input.partial_progress_enabled;
+	plan.partial_progress_max_commits = input.partial_progress_max_commits;
+	plan.partial_progress_max_failed_commits = input.partial_progress_max_failed_commits;
+	plan.max_concurrent_file_group_rewrites = input.max_concurrent_file_group_rewrites;
+	plan.rewrite_job_order = input.rewrite_job_order;
 	plan.table_info = std::move(table_info_ptr);
 
 	if (table_metadata.iceberg_version >= 3) {
@@ -301,6 +340,22 @@ RewritePlan PlanRewrite(ClientContext &context, RewriteDataFilesPlanInput input)
 
 	//! Reject an unknown or historical output spec before reading manifests.
 	auto output_spec_id = ResolveOutputSpecId(input, table_metadata);
+
+	Value only_paths_setting;
+	if (context.TryGetCurrentSetting("iceberg_rewrite_only_paths", only_paths_setting) &&
+	    !only_paths_setting.IsNull()) {
+		auto text = StringValue::Get(only_paths_setting);
+		if (!text.empty()) {
+			for (auto &path : StringUtil::Split(text, "\n")) {
+				if (!path.empty()) {
+					input.only_paths.insert(path);
+				}
+			}
+		}
+	}
+	if (!input.only_paths.empty()) {
+		input.rewrite_all = true;
+	}
 
 	auto latest_snapshot = table_metadata.GetLatestSnapshot();
 	if (!latest_snapshot) {
@@ -347,7 +402,7 @@ RewritePlan PlanRewrite(ClientContext &context, RewriteDataFilesPlanInput input)
 		CollectPartitionedCandidates(per_partition, other_specs, manifest_files, input, output_spec_id);
 		SelectCandidates(plan, input, per_partition, other_specs);
 	}
-
+	OrderRewriteGroups(plan);
 	return plan;
 }
 
