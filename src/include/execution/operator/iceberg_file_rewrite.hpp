@@ -73,6 +73,8 @@ protected:
 	virtual void StageRewrite(IcebergTransactionData &transaction_data, const IcebergFileRewriteGlobalState &state,
 	                          IcebergSnapshotOperationType operation, vector<IcebergManifestEntry> &&new_entries,
 	                          IcebergManifestDeletes &&replaced_files) const;
+	//! Shared commit path used by sink finalize and callers that must stage when COPY produced no output rows.
+	void CommitRewrite(ClientContext &context, IcebergFileRewriteGlobalState &state) const;
 };
 
 } // namespace duckdb

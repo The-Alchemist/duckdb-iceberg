@@ -84,9 +84,10 @@ SinkResultType IcebergFileRewrite::Sink(ExecutionContext &context, DataChunk &ch
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
-SinkFinalizeType IcebergFileRewrite::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-                                              OperatorSinkFinalizeInput &input) const {
-	auto &state = input.global_state.Cast<IcebergFileRewriteGlobalState>();
+void IcebergFileRewrite::CommitRewrite(ClientContext &context, IcebergFileRewriteGlobalState &state) const {
+	if (state.staged) {
+		return;
+	}
 	auto new_entries = IcebergInsert::GetInsertManifestEntries(state);
 	state.added_data_files = new_entries.size();
 	auto rewrite = GetRewriteInput(state);
@@ -95,7 +96,7 @@ SinkFinalizeType IcebergFileRewrite::Finalize(Pipeline &pipeline, Event &event, 
 			throw InternalException("Iceberg file rewrite produced files without replacing any input files");
 		}
 		state.staged = true;
-		return SinkFinalizeType::READY;
+		return;
 	}
 
 	if (rewrite.data_sequence_number) {
@@ -116,6 +117,12 @@ SinkFinalizeType IcebergFileRewrite::Finalize(Pipeline &pipeline, Event &event, 
 		StageRewrite(transaction_data, state, rewrite.operation, std::move(new_entries), std::move(replaced_files));
 	});
 	state.staged = true;
+}
+
+SinkFinalizeType IcebergFileRewrite::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+                                              OperatorSinkFinalizeInput &input) const {
+	auto &state = input.global_state.Cast<IcebergFileRewriteGlobalState>();
+	CommitRewrite(context, state);
 	return SinkFinalizeType::READY;
 }
 

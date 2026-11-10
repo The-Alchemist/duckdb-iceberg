@@ -151,7 +151,14 @@ SourceResultType PhysicalRewriteDataFiles::GetDataInternal(ExecutionContext &con
 	int64_t rewritten_bytes = 0;
 	int64_t removed_delete_files = 0;
 	if (!children.empty()) {
+		if (!sink_state) {
+			throw InternalException("iceberg_rewrite_data_files: missing rewrite sink state");
+		}
 		auto &gstate = sink_state->Cast<RewriteDataFilesGlobalState>();
+		//! A fully deleted rewrite can complete COPY without emitting output files. Ensure invalidations still stage.
+		if (!gstate.staged && !gstate.plan.selected_candidates.empty()) {
+			CommitRewrite(context.client, gstate);
+		}
 		rewritten_data_files = NumericCast<int64_t>(gstate.plan.selected_candidates.size());
 		added_data_files = NumericCast<int64_t>(gstate.added_data_files);
 		for (auto &candidate : gstate.plan.selected_candidates) {
