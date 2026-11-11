@@ -1,0 +1,55 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/rewrite_data_files_after_truncate.test
+# description: After TRUNCATE, rewrite can remove orphaned data files without writing replacements
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+include test/sql/init_requires
+
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.rewrite_after_truncate;
+
+statement ok
+CREATE TABLE my_datalake.default.rewrite_after_truncate (id INTEGER)
+WITH ('format-version' = 2);
+
+statement ok
+INSERT INTO my_datalake.default.rewrite_after_truncate SELECT i FROM range(50) t(i);
+
+statement ok
+INSERT INTO my_datalake.default.rewrite_after_truncate SELECT i FROM range(50, 100) t(i);
+
+statement ok
+INSERT INTO my_datalake.default.rewrite_after_truncate SELECT i FROM range(100, 150) t(i);
+
+query I
+SELECT count(*) FROM iceberg_metadata('my_datalake.default.rewrite_after_truncate')
+WHERE content = 'DATA' AND status <> 'DELETED';
+----
+3
+
+statement ok
+TRUNCATE TABLE my_datalake.default.rewrite_after_truncate;
+
+query I
+SELECT count(*) FROM my_datalake.default.rewrite_after_truncate;
+----
+0
+
+query IIIII
+SELECT * FROM iceberg_rewrite_data_files(
+    'my_datalake.default.rewrite_after_truncate',
+    min_input_files => 1,
+    rewrite_all => true
+);
+----
+3	0	<REGEX>:[1-9][0-9]*	0	3
+
+query I
+SELECT count(*) FROM iceberg_metadata('my_datalake.default.rewrite_after_truncate')
+WHERE content = 'DATA' AND status <> 'DELETED';
+----
+0
+
+statement ok
+DROP TABLE my_datalake.default.rewrite_after_truncate;
