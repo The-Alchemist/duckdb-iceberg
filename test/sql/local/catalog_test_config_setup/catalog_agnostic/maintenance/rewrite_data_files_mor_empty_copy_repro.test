@@ -1,0 +1,64 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/rewrite_data_files_mor_empty_copy_repro.test
+# description: Regression for rewrite_all when MoR deletes empty every selected data file (uploaded repro shape)
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+include test/sql/init_requires
+
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.rewrite_empty_copy_repro;
+
+statement ok
+CREATE TABLE my_datalake.default.rewrite_empty_copy_repro (id INTEGER, project_id VARCHAR)
+WITH ('format-version' = 2);
+
+statement ok
+INSERT INTO my_datalake.default.rewrite_empty_copy_repro VALUES (1, 'p1');
+
+statement ok
+INSERT INTO my_datalake.default.rewrite_empty_copy_repro VALUES (2, 'p1');
+
+statement ok
+INSERT INTO my_datalake.default.rewrite_empty_copy_repro VALUES (3, 'p2');
+
+statement ok
+INSERT INTO my_datalake.default.rewrite_empty_copy_repro VALUES (4, 'p2');
+
+statement ok
+INSERT INTO my_datalake.default.rewrite_empty_copy_repro VALUES (5, 'p2');
+
+statement ok
+DELETE FROM my_datalake.default.rewrite_empty_copy_repro;
+
+query I
+SELECT count(*) FROM my_datalake.default.rewrite_empty_copy_repro;
+----
+0
+
+query IIII rowsort
+SELECT content, status, count(*), sum(record_count)
+FROM iceberg_metadata('my_datalake.default.rewrite_empty_copy_repro')
+GROUP BY 1, 2;
+----
+DATA	ADDED	5	5
+POSITION_DELETES	ADDED	5	5
+
+# COPY emits no parquet; must still replace snapshot without INTERNAL Error.
+query IIIII
+SELECT * FROM iceberg_rewrite_data_files(
+	'my_datalake.default.rewrite_empty_copy_repro',
+	rewrite_all => true
+);
+----
+5	0	<REGEX>:[1-9][0-9]*	0	5
+
+query I
+SELECT count(*)
+FROM iceberg_metadata('my_datalake.default.rewrite_empty_copy_repro')
+WHERE status <> 'DELETED';
+----
+0
+
+statement ok
+DROP TABLE my_datalake.default.rewrite_empty_copy_repro;
